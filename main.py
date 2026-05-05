@@ -1,11 +1,13 @@
 from preprocess import CREMI
 from train import main as train_model
-import torch
 
-init_train = CREMI(samplefolder='samples/train/', savefolder='data/train/', autocon=True)
-init_train.preprocess()
 
-init_test = CREMI(samplefolder='samples/test/', savefolder='data/test/', autocon=True)
-init_test.preprocess()
+def main():
+    container = CREMI(samplefolder='samples/train/', savefolder='data/train/', autocon=True)
+    container.preprocess()
+    container.test_train_split(train_folder='data/train/', test_folder='data/test/', train_volume=0.8)
+    train_model()
 
-# train_model()
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,17 @@
+[project]
+name = "cremi-unet"
+version = "0.1.0"
+description = "U-Net trained on CREMI fly brain dataset."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "albumentations>=2.0.8",
+    "h5py>=3.16.0",
+    "matplotlib>=3.10.9",
+    "numpy>=2.4.4",
+    "opencv-python>=4.13.0.92",
+    "pillow>=12.2.0",
+    "torch>=2.11.0",
+    "torchvision>=0.26.0",
+    "tqdm>=4.67.3",
+]
