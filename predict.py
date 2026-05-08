@@ -1,275 +1,194 @@
+from __future__ import annotations
+
 import argparse
 from pathlib import Path
-from typing import cast
 
-import cv2 as cv
-import albumentations as A
 import h5py
 import numpy as np
 import torch
-from albumentations.core.composition import TransformType
-from albumentations.pytorch import ToTensorV2
-from PIL import Image
 from tqdm import tqdm
 
-from dataload import image_index
-from model import MODEL_NAME_UNET, create_model, default_model_config
-from preprocess import CREMI
+from config import DEFAULT_BLOCK_SHAPE, DEFAULT_HALO, DEFAULT_OFFSETS, RAW_DATASET_KEY
+from data import iter_hdf_paths, normalize_raw
+from model import create_model
 
 
-IMAGE_EXTENSIONS = {'.bmp', '.jpeg', '.jpg', '.png', '.tif', '.tiff'}
-DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
-DEVICE_TYPE = DEVICE
-USE_AMP = DEVICE_TYPE == 'cuda'
-DEFAULT_VOLUME_DEPTH = 125
+def resolve_device(device: str) -> torch.device:
+    if device == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    return torch.device(device)
 
 
-def load_model(checkpoint_path, device):
+def load_checkpoint(checkpoint_path: Path, device: torch.device):
     checkpoint = torch.load(checkpoint_path, map_location=device)
-    if isinstance(checkpoint, dict) and 'state_dict' in checkpoint:
-        model_name = checkpoint.get('model_name', MODEL_NAME_UNET)
-        model_config = checkpoint.get('model_config', default_model_config(model_name))
-        state_dict = checkpoint['state_dict']
-        image_height = checkpoint.get('image_height', 200 if model_name == MODEL_NAME_UNET else 512)
-        image_width = checkpoint.get('image_width', 200 if model_name == MODEL_NAME_UNET else 512)
-        slice_radius = checkpoint.get('slice_radius', 0)
-        volume_depth = checkpoint.get('volume_depth', DEFAULT_VOLUME_DEPTH)
-    else:
-        model_name = MODEL_NAME_UNET
-        model_config = default_model_config(model_name)
-        state_dict = checkpoint
-        image_height = 200
-        image_width = 200
-        slice_radius = 0
-        volume_depth = DEFAULT_VOLUME_DEPTH
-
-    model = create_model(model_name, model_config).to(device)
-    model.load_state_dict(state_dict)
+    model = create_model(checkpoint["model_name"], checkpoint["model_config"]).to(device)
+    model.load_state_dict(checkpoint["state_dict"])
     model.eval()
-    metadata = {
-        'model_name': model_name,
-        'model_config': model_config,
-        'image_height': int(image_height),
-        'image_width': int(image_width),
-        'slice_radius': int(slice_radius),
-        'volume_depth': int(volume_depth) if volume_depth is not None else None,
-    }
-    return model, metadata
+    offsets = tuple(tuple(offset) for offset in checkpoint.get("offsets", DEFAULT_OFFSETS))
+    normalization = checkpoint.get("normalization", "scale01")
+    target_mode = checkpoint.get("target_mode", "affinity")
+    return model, offsets, normalization, target_mode, checkpoint
 
 
-def build_transform(channels, height, width):
-    transforms: list[TransformType] = [
-        A.Resize(height=height, width=width),
-        A.Normalize(
-            mean=(0.0,) * channels,
-            std=(1.0,) * channels,
-            max_pixel_value=255.0,
-        ),
-        ToTensorV2(),
-    ]
-    return A.Compose(transforms)
+def block_positions(length: int, block_size: int) -> list[tuple[int, int]]:
+    starts = list(range(0, length, block_size))
+    return [(start, min(start + block_size, length)) for start in starts]
 
 
-def ensure_channels(image, channels):
-    if image.ndim == 2:
-        image = np.repeat(image[:, :, None], channels, axis=2)
-    elif image.shape[-1] == 4:
-        image = image[:, :, :3]
-
-    if image.shape[-1] == channels:
-        return image
-
-    if channels == 3 and image.shape[-1] > 3:
-        return image[:, :, :3]
-
-    grayscale = image[:, :, 0]
-    return np.repeat(grayscale[:, :, None], channels, axis=2)
-
-
-def predict_array(model, transform, image, threshold):
-    original_height, original_width = image.shape[:2]
-    transformed = transform(image=image)
-    tensor = transformed['image'].unsqueeze(0).to(DEVICE)
-
-    with torch.no_grad():
-        with torch.autocast(device_type=DEVICE_TYPE, enabled=USE_AMP):
-            logits = model(tensor)
-            probs = logits.sigmoid()
-
-    mask = (probs.squeeze().cpu().numpy() > threshold).astype(np.uint8) * 255
-    if mask.shape != (original_height, original_width):
-        mask = cv.resize(mask, (original_width, original_height), interpolation=cv.INTER_NEAREST)
-
-    return mask
-
-
-def numeric_index(path, fallback):
-    try:
-        return image_index(path)
-    except ValueError:
-        return fallback
-
-
-def image_context(input_path):
-    image_paths = [path for path in iter_inputs(input_path) if path.suffix.lower() in IMAGE_EXTENSIONS]
-    indexed = [(numeric_index(path, idx), path) for idx, path in enumerate(image_paths)]
-    context = {}
-    path_to_index = {}
-    for idx, path in indexed:
-        context.setdefault(idx, path)
-        path_to_index[path] = idx
-    return image_paths, context, path_to_index
-
-
-def volume_bounds(center_idx, volume_depth):
-    if volume_depth is None:
+def parse_roi(values: list[int] | None) -> tuple[int, int, int, int, int, int] | None:
+    if values is None:
         return None
-
-    volume_start = (center_idx // volume_depth) * volume_depth
-    return volume_start, volume_start + volume_depth - 1
-
-
-def nearest_context_path(context, center_idx, image_idx, volume_depth):
-    bounds = volume_bounds(center_idx, volume_depth)
-    if bounds is not None:
-        image_idx = min(max(image_idx, bounds[0]), bounds[1])
-
-    if image_idx in context:
-        return context[image_idx]
-
-    candidate_indices = list(context)
-    if bounds is not None:
-        candidate_indices = [idx for idx in context if bounds[0] <= idx <= bounds[1]]
-        if not candidate_indices:
-            raise FileNotFoundError(f'No context images found within volume bounds {bounds}')
-
-    nearest_idx = min(candidate_indices, key=lambda idx: abs(idx - image_idx))
-    return context[nearest_idx]
+    if len(values) != 6:
+        raise argparse.ArgumentTypeError("ROI must be z0 z1 y0 y1 x0 x1")
+    z0, z1, y0, y1, x0, x1 = [int(value) for value in values]
+    if z0 < 0 or y0 < 0 or x0 < 0 or z1 <= z0 or y1 <= y0 or x1 <= x0:
+        raise ValueError(f"Invalid ROI: {values}")
+    return z0, z1, y0, y1, x0, x1
 
 
-def image_stack_from_context(image_path, channels, slice_radius, volume_depth, context, path_to_index):
-    if slice_radius <= 0:
-        return ensure_channels(np.array(Image.open(image_path)), channels)
-
-    center_idx = path_to_index[image_path]
-    images = []
-    for offset in range(-slice_radius, slice_radius + 1):
-        context_path = nearest_context_path(context, center_idx, center_idx + offset, volume_depth)
-        images.append(np.array(Image.open(context_path).convert('L')))
-    return ensure_channels(np.stack(images, axis=-1), channels)
+def roi_shape(roi: tuple[int, int, int, int, int, int] | None, source_shape: tuple[int, int, int]) -> tuple[int, int, int]:
+    if roi is None:
+        return source_shape
+    z0, z1, y0, y1, x0, x1 = roi
+    if z1 > source_shape[0] or y1 > source_shape[1] or x1 > source_shape[2]:
+        raise ValueError(f"ROI {roi} exceeds source shape {source_shape}")
+    return z1 - z0, y1 - y0, x1 - x0
 
 
-def predict_image_file(model, transform, image_path, output_dir, threshold, channels, slice_radius, volume_depth, context, path_to_index):
-    image = image_stack_from_context(image_path, channels, slice_radius, volume_depth, context, path_to_index)
-    mask = predict_array(model, transform, image, threshold)
-    output_path = output_dir / f'{image_path.stem}_pred.png'
-    cv.imwrite(str(output_path), mask)
-    return output_path
+def expanded_slices(
+    output_start: tuple[int, int, int],
+    output_stop: tuple[int, int, int],
+    source_shape: tuple[int, int, int],
+    roi_start: tuple[int, int, int],
+    halo: tuple[int, int, int],
+) -> tuple[tuple[slice, ...], tuple[slice, ...]]:
+    input_slices = []
+    crop_slices = []
+    for start, stop, roi_axis_start, size, pad in zip(output_start, output_stop, roi_start, source_shape, halo):
+        source_output_start = roi_axis_start + start
+        source_output_stop = roi_axis_start + stop
+        input_start = max(source_output_start - pad, 0)
+        input_stop = min(source_output_stop + pad, size)
+        crop_start = source_output_start - input_start
+        crop_stop = crop_start + (stop - start)
+        input_slices.append(slice(input_start, input_stop))
+        crop_slices.append(slice(crop_start, crop_stop))
+    return tuple(input_slices), tuple(crop_slices)
 
 
-def hdf_stack(raw, z_index, channels, slice_radius):
-    if slice_radius <= 0:
-        return ensure_channels(np.asarray(raw[z_index, :, :]), channels)
-
-    images = []
-    max_z = raw.shape[0] - 1
-    for offset in range(-slice_radius, slice_radius + 1):
-        context_z = min(max(z_index + offset, 0), max_z)
-        images.append(np.asarray(raw[context_z, :, :]))
-    return ensure_channels(np.stack(images, axis=-1), channels)
+def output_path_for(input_path: Path, output_dir: Path) -> Path:
+    stem = input_path.stem
+    return output_dir / f"{stem}_affinities.h5"
 
 
-def predict_hdf_file(model, transform, hdf_path, output_dir, threshold, raw_dataset, channels, slice_radius):
-    output_paths = []
-    with h5py.File(hdf_path, 'r') as dataset:
-        if raw_dataset not in dataset:
-            raise KeyError(f'{hdf_path} does not contain {raw_dataset}')
+def predict_file(
+    input_path: Path,
+    output_path: Path,
+    model,
+    offsets,
+    raw_key: str,
+    output_key: str,
+    block_shape: tuple[int, int, int],
+    halo: tuple[int, int, int],
+    device: torch.device,
+    use_amp: bool,
+    normalization: str,
+    target_mode: str,
+    roi: tuple[int, int, int, int, int, int] | None,
+) -> None:
+    device_type = "cuda" if device.type == "cuda" else "cpu"
+    with h5py.File(input_path, "r") as src, h5py.File(output_path, "w") as dst:
+        if raw_key not in src:
+            raise KeyError(f"{input_path} does not contain {raw_key}")
 
-        raw = cast(h5py.Dataset, dataset[raw_dataset])
-        for z_index in tqdm(range(raw.shape[0]), desc=f'Predicting {hdf_path.name}'):
-            image = hdf_stack(raw, z_index, channels, slice_radius)
-            mask = predict_array(model, transform, image, threshold)
-            output_path = output_dir / f'{hdf_path.stem}_z{z_index:04d}_pred.png'
-            cv.imwrite(str(output_path), mask)
-            output_paths.append(output_path)
+        raw_dataset = src[raw_key]
+        source_shape = tuple(raw_dataset.shape[:3])
+        volume_shape = roi_shape(roi, source_shape)
+        roi_start = (0, 0, 0) if roi is None else (roi[0], roi[2], roi[4])
+        out = dst.create_dataset(
+            output_key,
+            shape=(len(offsets), *volume_shape),
+            dtype=np.uint8,
+            chunks=(1, min(block_shape[0], volume_shape[0]), min(block_shape[1], volume_shape[1]), min(block_shape[2], volume_shape[2])),
+            compression="gzip",
+            compression_opts=4,
+        )
+        out.attrs["offsets"] = np.asarray(offsets, dtype=np.int32)
+        out.attrs["source_file"] = str(input_path)
+        out.attrs["raw_key"] = raw_key
+        out.attrs["target_mode"] = target_mode
+        if roi is not None:
+            out.attrs["roi"] = np.asarray(roi, dtype=np.int64)
 
-    return output_paths
+        z_blocks = block_positions(volume_shape[0], block_shape[0])
+        y_blocks = block_positions(volume_shape[1], block_shape[1])
+        x_blocks = block_positions(volume_shape[2], block_shape[2])
+        total_blocks = len(z_blocks) * len(y_blocks) * len(x_blocks)
+
+        with torch.no_grad(), tqdm(total=total_blocks, desc=f"Predicting {input_path.name}") as progress:
+            for z0, z1 in z_blocks:
+                for y0, y1 in y_blocks:
+                    for x0, x1 in x_blocks:
+                        output_start = (z0, y0, x0)
+                        output_stop = (z1, y1, x1)
+                        input_slices, crop_slices = expanded_slices(output_start, output_stop, source_shape, roi_start, halo)
+                        raw = normalize_raw(np.asarray(raw_dataset[input_slices]), normalization)
+                        tensor = torch.from_numpy(np.ascontiguousarray(raw[None, None], dtype=np.float32)).to(device)
+
+                        with torch.autocast(device_type=device_type, enabled=use_amp):
+                            probs = model(tensor).sigmoid()
+                        probs = probs[0, :, crop_slices[0], crop_slices[1], crop_slices[2]]
+                        probs_uint8 = (probs.clamp(0.0, 1.0) * 255.0).round().to(torch.uint8).cpu().numpy()
+                        out[:, z0:z1, y0:y1, x0:x1] = probs_uint8
+                        progress.update(1)
 
 
-def iter_inputs(input_path):
-    if input_path.is_file():
-        yield input_path
-        return
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Predict CREMI affinity maps from raw HDF volumes.")
+    parser.add_argument("input", type=Path, help="HDF file or folder containing HDF files.")
+    parser.add_argument("--checkpoint", type=Path, default=Path("checkpoints/affinity/best.pth.tar"))
+    parser.add_argument("--output-dir", type=Path, default=Path("predictions/affinities"))
+    parser.add_argument("--raw-key", default=RAW_DATASET_KEY)
+    parser.add_argument("--output-key", default="affinities")
+    parser.add_argument("--block-shape", nargs=3, type=int, default=DEFAULT_BLOCK_SHAPE, metavar=("Z", "Y", "X"))
+    parser.add_argument("--halo", nargs=3, type=int, default=DEFAULT_HALO, metavar=("Z", "Y", "X"))
+    parser.add_argument("--roi", nargs=6, type=int, default=None, metavar=("Z0", "Z1", "Y0", "Y1", "X0", "X1"))
+    parser.add_argument("--device", default="auto")
+    parser.add_argument("--no-amp", action="store_true")
+    return parser
 
-    for path in sorted(input_path.rglob('*')):
-        if path.is_file() and (path.suffix.lower() in IMAGE_EXTENSIONS or path.suffix.lower() in {'.h5', '.hdf', '.hdf5'}):
-            yield path
 
-
-def main():
-    parser = argparse.ArgumentParser(description='Run EM membrane segmentation inference from a trained U-Net checkpoint.')
-    parser.add_argument('input', type=Path, help='Image file, image folder, HDF file, or folder containing HDF/images.')
-    parser.add_argument('--checkpoint', type=Path, default=Path('checkpoint.pth.tar'), help='Path to trained checkpoint.')
-    parser.add_argument('--output-dir', type=Path, default=Path('predictions'), help='Directory for predicted mask PNGs.')
-    parser.add_argument('--threshold', type=float, default=0.5, help='Sigmoid threshold for binary masks.')
-    parser.add_argument('--raw-dataset', default=CREMI.RAW_DATASET, help='HDF dataset path containing raw EM volume.')
-    parser.add_argument('--volume-depth', type=int, default=None, help='Number of slices per original PNG volume for 2.5D folder inference.')
-    args = parser.parse_args()
-
+def main(argv: list[str] | None = None) -> None:
+    args = build_parser().parse_args(argv)
     if not args.checkpoint.exists():
-        raise FileNotFoundError(f'Checkpoint not found: {args.checkpoint}')
+        raise FileNotFoundError(f"Checkpoint not found: {args.checkpoint}")
     if not args.input.exists():
-        raise FileNotFoundError(f'Input path not found: {args.input}')
+        raise FileNotFoundError(f"Input path not found: {args.input}")
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    device = resolve_device(args.device)
+    use_amp = device.type == "cuda" and not args.no_amp
+    model, offsets, normalization, target_mode, _ = load_checkpoint(args.checkpoint, device)
+    roi = parse_roi(args.roi)
 
-    model, metadata = load_model(args.checkpoint, DEVICE)
-    channels = int(metadata['model_config']['in_chan'])
-    slice_radius = metadata['slice_radius']
-    volume_depth = args.volume_depth if args.volume_depth is not None else metadata['volume_depth']
-    transform = build_transform(channels, metadata['image_height'], metadata['image_width'])
-    image_paths, context, path_to_index = image_context(args.input)
-
-    written = []
-    for input_path in iter_inputs(args.input):
-        suffix = input_path.suffix.lower()
-        if suffix in {'.h5', '.hdf', '.hdf5'}:
-            written.extend(
-                predict_hdf_file(
-                    model,
-                    transform,
-                    input_path,
-                    args.output_dir,
-                    args.threshold,
-                    args.raw_dataset,
-                    channels,
-                    slice_radius,
-                )
-            )
-        elif suffix in IMAGE_EXTENSIONS:
-            written.append(
-                predict_image_file(
-                    model,
-                    transform,
-                    input_path,
-                    args.output_dir,
-                    args.threshold,
-                    channels,
-                    slice_radius,
-                    volume_depth,
-                    context,
-                    path_to_index,
-                )
-            )
-
-    if not written:
-        raise FileNotFoundError(f'No supported image or HDF files found in {args.input}')
-
-    print(f'Saved {len(written)} prediction mask(s) to {args.output_dir}')
-    print(f'Device: {DEVICE}, checkpoint: {args.checkpoint}')
-    print(f"Model: {metadata['model_name']}, input size: {metadata['image_height']}x{metadata['image_width']}")
-    print(f'Slice radius: {slice_radius}, volume depth: {volume_depth}, channels: {channels}, threshold: {args.threshold}')
+    for input_path in iter_hdf_paths(args.input):
+        output_path = output_path_for(input_path, args.output_dir)
+        predict_file(
+            input_path=input_path,
+            output_path=output_path,
+            model=model,
+            offsets=offsets,
+            raw_key=args.raw_key,
+            output_key=args.output_key,
+            block_shape=tuple(args.block_shape),
+            halo=tuple(args.halo),
+            device=device,
+            use_amp=use_amp,
+            normalization=normalization,
+            target_mode=target_mode,
+            roi=roi,
+        )
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

@@ -6,3 +6,5 @@ Pillow
 torch
 torchvision
 numpy
+scipy
+scikit-image

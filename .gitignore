@@ -4,8 +4,11 @@ __pycache__/
 data/
 samples/
 saved_images/
+checkpoints/
+predictions/
 
 *.png
+*.h5
 *.hdf
 *.tar
 *.pth
